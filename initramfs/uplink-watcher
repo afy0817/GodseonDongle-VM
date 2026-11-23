@@ -1,0 +1,259 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Afcoo
+# SPDX-FileCopyrightText: 2026 GodSeon
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Derived from ThruRNDIS_VM_Assets usb0-watcher. Keeps a gateway (eth0-usb0-gateway) up for
+# the usable uplinks: wlan0 once wpa_supplicant has associated and wlan0 has an address (DHCP
+# lease or static), and usb0, a phone's USB tethering (RNDIS), whenever it exists.
+# GodseonDongle-VM change: what "the usable uplinks" are depends on the app that booted the
+# image (/usr/local/libexec/thrurndis-wifi/mode).
+# thrurndis mode (ThruRNDIS-Wi-Fi): one uplink at a time, usb0 when present, otherwise wlan0, as
+# in stock ThruRNDIS; both use the stock table 100, rule 1000 and nft table thrurndis from the
+# host link 192.168.100.2, so the one going out of use is taken down before the other comes up.
+# godseon mode (GodseonDongle): the two run side by side instead of usb0 replacing wlan0, so a
+# phone and a dongle work at the same time. The Mac picks one by the source address it sends from:
+#   wlan0  from its VZ NAT bridge address    table 100, rule 1000, nft table thrurndis
+#   usb0   from the host link 10.94.8.2      table 101, rule 1001, nft table thrurndis_usb0,
+#                                            DNS proxy 10.94.8.1:53 -> the phone's DNS server
+# wlan0 also gets THRURNDIS_RNDIS_ALLOW_SUBNET_ONLY=1, because a static network may have no
+# router or DNS server and its address is managed by wpa-action.
+# Every call holds the ready marker (THRURNDIS_RNDIS_HOLD_ROUTE_READY=1): once announced, the
+# console keeps THRURNDIS_RNDIS_ROUTE_READY=1 for the life of the VM, across Wi-Fi drops and
+# network switches.
+# GodseonDongle change: the full gateway status check (ip rule and nft dumps, some twenty
+# processes) ran every 2 s and was a large part of the guest's idle CPU. A fingerprint read with
+# shell builtins (the interface names, wlan0/usb0 ifindex and carrier, the lease file) is still
+# taken every 2 s; the full pass runs when it changes, while a gateway is not ready, and
+# otherwise every STATUS_EVERY passes. Each uplink's state goes to /run/thrurndis-wifi/uplinks
+# ("usb0 ready") for api.cgi.
+# usbnet names an RNDIS link eth<n> instead of usb<n> when the phone's MAC address is not a
+# locally administered one; such a link is renamed usb0.
+# A guard table (godseon_guard) stays for the life of the VM: IPv4 forwarding is on while either
+# gateway is up, and each gateway's own drops cover only its own uplink, so without it the other
+# uplink's network could reach the Mac, other VMs or this network through the guest while its
+# gateway is down. (ThruRNDIS port forwarding, inbound from an uplink, would be dropped too;
+# GodseonDongle never turns it on.) thrurndis mode has a single gateway and no guard, so
+# ThruRNDIS's port forwarding keeps working there.
+
+BB=/usr/bin/busybox
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
+export PATH
+
+# shellcheck source=/usr/local/libexec/thrurndis-wifi/mode
+. /usr/local/libexec/thrurndis-wifi/mode
+export THRURNDIS_WIFI_MODE
+
+RNDIS_IFACE=usb0
+WLAN_IFACE=${THRURNDIS_WIFI_WLAN_IFACE:-wlan0}
+VZNAT_IFACE=${THRURNDIS_VZNAT_IFACE:-eth0}
+WLAN_RESOLV_CONF=${THRURNDIS_WIFI_WLAN_RESOLV_CONF:-/run/thrurndis-wifi/resolv.conf}
+WLAN_DISCARD_RESOLV_CONF=/run/thrurndis-wifi/resolv.discard
+WATCH_INTERVAL_SECONDS=${THRURNDIS_USB0_WATCH_INTERVAL_SECONDS:-2}
+GATEWAY_SCRIPT=${THRURNDIS_GATEWAY_SCRIPT:-/usr/local/sbin/eth0-usb0-gateway}
+STATUS_EVERY=${GODSEON_GATEWAY_STATUS_EVERY:-15}
+LEASE_FILE=/run/thrurndis-wifi/lease
+STATE_FILE=/run/thrurndis-wifi/uplinks
+# The Mac's end of the host link, the source of its internet traffic through the phone.
+TETHER_HOST_IPV4=${GODSEON_TETHER_HOST_IPV4:-10.94.8.2}
+# usb0's MTU (and the TCP MSS clamp that goes with it, see eth0-usb0-gateway). Measured on a
+# Galaxy over a Korean LTE/5G network: 1400-byte packets pass, 1428-byte ones vanish silently.
+TETHER_MTU=${GODSEON_TETHER_MTU:-1400}
+
+log() {
+    echo "thrurndis-wifi-uplink-watcher: $*" >/dev/kmsg 2>/dev/null || true
+}
+
+log_console() {
+    log "$*"
+    if [ -c /dev/console ]; then
+        echo "thrurndis-wifi-uplink-watcher: $*" >/dev/console 2>/dev/null || true
+    else
+        echo "thrurndis-wifi-uplink-watcher: $*" 2>/dev/null || true
+    fi
+}
+
+wlan_ready() {
+    [ -e "/sys/class/net/$WLAN_IFACE" ] || return 1
+    carrier=""
+    { read -r carrier <"/sys/class/net/$WLAN_IFACE/carrier"; } 2>/dev/null
+    [ "$carrier" = 1 ] || return 1
+    ip -4 -o addr show dev "$WLAN_IFACE" scope global 2>/dev/null | $BB grep -q inet
+}
+
+usb_ready() {
+    [ -e "/sys/class/net/$RNDIS_IFACE" ]
+}
+
+# Only answers to what the Mac started leave an uplink, whichever gateways are up (see above).
+ensure_guard() {
+    nft list table ip godseon_guard >/dev/null 2>&1 && return 0
+    for module in nfnetlink nf_tables nf_conntrack nft_ct; do
+        /sbin/modprobe -q "$module" 2>/dev/null || true
+    done
+    if nft -f - <<EOF_NFT
+table ip godseon_guard {
+    chain forward {
+        type filter hook forward priority -10; policy accept;
+        iifname { "$WLAN_IFACE", "$RNDIS_IFACE" } oifname "$VZNAT_IFACE" ct state established,related accept
+        iifname { "$WLAN_IFACE", "$RNDIS_IFACE" } drop
+    }
+}
+EOF_NFT
+    then
+        log_console "forward guard installed for $WLAN_IFACE and $RNDIS_IFACE"
+    else
+        log_console "could not install the forward guard; will retry"
+    fi
+}
+
+# An RNDIS (or CDC Ethernet) link that usbnet called eth<n> becomes usb0.
+rename_rndis() {
+    [ -e "/sys/class/net/$RNDIS_IFACE" ] && return 0
+    for path in /sys/class/net/*; do
+        name=${path##*/}
+        case "$name" in
+            lo|"$VZNAT_IFACE"|"$WLAN_IFACE"|"$RNDIS_IFACE") continue ;;
+        esac
+        [ -e "$path/device/driver" ] || continue
+        driver=$($BB readlink "$path/device/driver" 2>/dev/null)
+        case "${driver##*/}" in
+            rndis_host|cdc_ether|cdc_subset)
+                ip link set dev "$name" down 2>/dev/null || true
+                if ip link set dev "$name" name "$RNDIS_IFACE" 2>/dev/null; then
+                    log_console "renamed tethering link $name to $RNDIS_IFACE"
+                else
+                    log_console "could not rename tethering link $name to $RNDIS_IFACE"
+                fi
+                return 0
+                ;;
+        esac
+    done
+}
+
+# usb0 keeps the upstream behaviour (DHCP here, /etc/resolv.conf); in godseon mode under its own
+# table, rule and nft table. wlan0 DNS comes from wlan0-dhcp's own resolv file; "down" gets a
+# throwaway file so tearing the gateway down never wipes a still-valid wlan0 lease.
+run_gateway() {
+    iface=$1
+    shift
+    export THRURNDIS_RNDIS_HOLD_ROUTE_READY=1
+    if [ "$iface" = "$RNDIS_IFACE" ] && [ "$THRURNDIS_WIFI_MODE" != godseon ]; then
+        THRURNDIS_RNDIS_IFACE=$iface "$GATEWAY_SCRIPT" "$@"
+    elif [ "$iface" = "$RNDIS_IFACE" ]; then
+        THRURNDIS_RNDIS_IFACE=$iface THRURNDIS_RNDIS_ROUTE_TABLE=101 THRURNDIS_RNDIS_ROUTE_PRIORITY=1001 \
+            THRURNDIS_NFT_TABLE=thrurndis_usb0 THRURNDIS_HOST_LINK_HOST_IPV4=$TETHER_HOST_IPV4 \
+            GODSEON_UPLINK_MTU=$TETHER_MTU "$GATEWAY_SCRIPT" "$@"
+    elif [ "$1" = down ]; then
+        THRURNDIS_RNDIS_IFACE=$iface THRURNDIS_RNDIS_RESOLV_CONF=$WLAN_DISCARD_RESOLV_CONF \
+            THRURNDIS_RNDIS_ALLOW_SUBNET_ONLY=1 "$GATEWAY_SCRIPT" "$@"
+    else
+        THRURNDIS_RNDIS_IFACE=$iface THRURNDIS_RNDIS_RESOLV_CONF=$WLAN_RESOLV_CONF \
+            THRURNDIS_RNDIS_ALLOW_SUBNET_ONLY=1 "$GATEWAY_SCRIPT" "$@"
+    fi
+}
+
+# Brings one uplink's gateway in line with whether the uplink is usable ($2 = yes). The state
+# lives in state_<iface>: absent, ready, incomplete or failed (empty before the first pass).
+manage() {
+    iface=$1
+    eval "state=\${state_$iface:-}"
+    if [ "$2" != yes ]; then
+        if [ -n "$state" ] && [ "$state" != absent ]; then
+            log_console "uplink $iface is no longer usable; clearing gateway state"
+            run_gateway "$iface" down || true
+        fi
+        state=absent
+    elif run_gateway "$iface" status >/dev/null 2>&1; then
+        [ "$state" = ready ] || log_console "$iface gateway is ready"
+        state=ready
+    else
+        case "$state" in
+            ready) log_console "$iface gateway state changed; reconfiguring" ;;
+            failed|incomplete) : ;;
+            *) log_console "uplink $iface is usable; configuring its gateway" ;;
+        esac
+        if run_gateway "$iface" up; then
+            if run_gateway "$iface" status >/dev/null 2>&1; then
+                log_console "$iface gateway configured"
+                state=ready
+            else
+                log_console "$iface gateway configuration completed but status is incomplete"
+                state=incomplete
+            fi
+        else
+            log_console "$iface gateway configuration failed; will retry"
+            state=failed
+        fi
+    fi
+    eval "state_$iface=\$state"
+}
+
+# Nothing left to do until the fingerprint changes: every uplink is ready or absent.
+settled() {
+    for iface in "$WLAN_IFACE" "$RNDIS_IFACE"; do
+        eval "state=\${state_$iface:-}"
+        case "$state" in
+            ready|absent) ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+written=""
+write_state() {
+    eval "wlan_state=\${state_$WLAN_IFACE:-absent} usb_state=\${state_$RNDIS_IFACE:-absent}"
+    text="$WLAN_IFACE $wlan_state
+$RNDIS_IFACE $usb_state"
+    [ "$text" = "$written" ] && return 0
+    printf '%s\n' "$text" >"$STATE_FILE.tmp" && $BB mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+    written=$text
+}
+
+# Sets $fingerprint from sysfs and the lease file using builtins only.
+take_fingerprint() {
+    fingerprint=""
+    for path in /sys/class/net/*; do
+        fingerprint="$fingerprint ${path##*/}"
+    done
+    for file in "/sys/class/net/$WLAN_IFACE/ifindex" "/sys/class/net/$WLAN_IFACE/carrier" \
+        "/sys/class/net/$RNDIS_IFACE/ifindex" "/sys/class/net/$RNDIS_IFACE/carrier" "$LEASE_FILE"; do
+        fingerprint="$fingerprint;"
+        [ -r "$file" ] || continue
+        { while IFS= read -r line; do fingerprint="$fingerprint|$line"; done <"$file"; } 2>/dev/null
+    done
+}
+
+$BB mkdir -p /run/thrurndis-wifi
+log_console "started ($THRURNDIS_WIFI_MODE mode); watching $WLAN_IFACE and $RNDIS_IFACE every ${WATCH_INTERVAL_SECONDS}s"
+
+pass=0
+last_fingerprint=""
+while true; do
+    take_fingerprint
+    pass=$((pass + 1))
+    if settled && [ "$fingerprint" = "$last_fingerprint" ] && [ $((pass % STATUS_EVERY)) -ne 0 ]; then
+        $BB sleep "$WATCH_INTERVAL_SECONDS"
+        continue
+    fi
+    last_fingerprint=$fingerprint
+
+    rename_rndis
+    if [ "$THRURNDIS_WIFI_MODE" = godseon ]; then
+        ensure_guard
+        manage "$WLAN_IFACE" "$(wlan_ready && echo yes)"
+        manage "$RNDIS_IFACE" "$(usb_ready && echo yes)"
+    elif usb_ready; then
+        manage "$WLAN_IFACE" no
+        manage "$RNDIS_IFACE" yes
+    else
+        manage "$RNDIS_IFACE" no
+        manage "$WLAN_IFACE" "$(wlan_ready && echo yes)"
+    fi
+    write_state
+    if [ "$wlan_state" = absent ] && [ "$usb_state" = absent ]; then
+        [ -x /sbin/mdev ] && /sbin/mdev -s 2>/dev/null || true
+    fi
+
+    $BB sleep "$WATCH_INTERVAL_SECONDS"
+done

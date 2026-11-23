@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: 2026 GodSeon
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Builds the VM image on an arm64 Linux runner (Docker, Alpine aarch64). Every run keeps the
+# image, its corresponding source and their checksums as artifacts; a v* tag publishes them
+# together as a GitHub release, the place the apps download vm_assets.zip from. A release is
+# never replaced: a fixed image gets a new tag.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vm:
+    name: VM image (Linux arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: write   # gh release create, on tags only
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the image, notices and sources
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then version=${GITHUB_REF_NAME#v}; else version=dev-${GITHUB_SHA::7}; fi
+          GODSEON_VM_VERSION=$version ./build.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vm_assets
+          path: |
+            dist/vm_assets.zip
+            dist/vm_assets-sources.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists; releases are not replaced" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/vm_assets.zip dist/vm_assets-sources.tar.gz \
+            dist/SHA256SUMS --title "GodseonDongle-VM ${GITHUB_REF_NAME#v}" \
+            --notes-file dist/vm_assets/compliance/SOURCE.md

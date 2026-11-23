@@ -1,0 +1,101 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 GodSeon
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# usbip-attach: keep the macOS host's USB devices (the Wi-Fi dongle, a tethering phone)
+# attached over USB/IP. Kernel command line: godseon.usbip=HOST[:PORT]/BUSID, and more devices
+# as godseon.usbip2= to godseon.usbip4= (an older image reads only the first). HOST may be "gw"
+# for the Mac, the gateway of the VZNAT link (eth0); PORT defaults to 9408.
+# Example: godseon.usbip=gw/1-1 godseon.usbip2=gw/1-2
+# Without the option this does nothing. A bus ID with no device behind it on the Mac fails
+# to attach and is tried again every 3 s, quietly.
+
+BB=/usr/bin/busybox
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin
+export PATH
+
+log() {
+    echo "usbip-attach: $*" >/dev/kmsg 2>/dev/null || true
+}
+
+specs=""
+for opt in $($BB cat /proc/cmdline); do
+    case "$opt" in
+    godseon.usbip=*|godseon.usbip[2-4]=*) specs="$specs ${opt#*=}" ;;
+    esac
+done
+[ -n "$specs" ] || exec $BB sleep 2147483647
+
+VZNAT_IFACE=${THRURNDIS_VZNAT_IFACE:-eth0}
+
+/sbin/modprobe -q vhci_hcd 2>/dev/null || log "vhci_hcd did not load"
+# usbip records each attach under /var/run/vhci_hcd and reports a failure (after
+# attaching) when it cannot.
+$BB mkdir -p /var/run/vhci_hcd
+
+VHCI_STATUS=/sys/devices/platform/vhci_hcd.0/status
+VHCI_RECORDS=/var/run/vhci_hcd
+
+# Checked every 3 s for the life of the VM, so builtins only. The vhci status
+# lines read "hub port sta spd dev sockfd local_busid", sta 006 = in use; port
+# counts across the high-speed and SuperSpeed hubs, and local_busid is the
+# guest's own name for the device, not the Mac's bus ID. That one is in the
+# record usbip attach writes for the port: /var/run/vhci_hcd/port<N> holds
+# "host port busid". Its variables start with a_: sh has no locals, and
+# attach_one's are in use around the call.
+attached() {
+    if [ -r "$VHCI_STATUS" ]; then
+        { while read -r a_hub a_port a_sta a_rest; do
+            [ "$a_sta" = 006 ] || continue
+            a_number=${a_port#"${a_port%%[!0]*}"}
+            a_remote=""
+            { read -r a_host a_tcp a_remote <"$VHCI_RECORDS/port${a_number:-0}"; } 2>/dev/null
+            [ "$a_remote" = "$1" ] && return 0
+        done <"$VHCI_STATUS"; } 2>/dev/null
+        return 1
+    fi
+    usbip port 2>/dev/null | $BB grep -q "/$1\$"
+}
+
+mac_address() {
+    # Only eth0's: once Wi-Fi is up, wlan0 has a default route of its own.
+    ip -4 route show default dev "$VZNAT_IFACE" 2>/dev/null | $BB awk '{ print $2 == "via" ? $3 : $2; exit }'
+}
+
+# attach_one <index> <HOST[:PORT]/BUSID>; failures_<index> counts the failures in a row.
+attach_one() {
+    index=$1
+    spec=$2
+    hostport=${spec%%/*}
+    busid=${spec#*/}
+    host=${hostport%%:*}
+    tcp_port=9408
+    case "$hostport" in
+    *:*) tcp_port=${hostport#*:} ;;
+    esac
+    attached "$busid" && return 0
+    target=$host
+    [ "$target" = gw ] && target=$(mac_address)
+    [ -n "$target" ] || return 0
+    eval "failures=\${failures_$index:-0}"
+    if usbip --tcp-port "$tcp_port" attach -r "$target" -b "$busid" >/tmp/usbip-attach.log 2>&1; then
+        log "attached $busid from $target:$tcp_port"
+        failures=0
+    else
+        failures=$((failures + 1))
+        # log the first failure and then every 100th, not every 3 seconds
+        if [ "$failures" -eq 1 ] || [ $((failures % 100)) -eq 0 ]; then
+            log "attach $busid from $target:$tcp_port failed ($failures): $($BB tr '\n' ' ' </tmp/usbip-attach.log)"
+        fi
+    fi
+    eval "failures_$index=\$failures"
+}
+
+while :; do
+    index=0
+    for spec in $specs; do
+        index=$((index + 1))
+        attach_one "$index" "$spec"
+    done
+    $BB sleep 3
+done

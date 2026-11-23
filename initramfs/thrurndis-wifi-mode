@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2026 GodSeon
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Sourced by the guest scripts (installed as /usr/local/libexec/thrurndis-wifi/mode). One image
+# serves two macOS apps, and this tells which one booted it:
+#
+#   thrurndis  ThruRNDIS-Wi-Fi. ThruRNDIS boots the image from its manual VM asset folder and
+#              passes the dongle through its own USB controller. The Mac reaches the guest
+#              from ThruRNDIS's host link 192.168.100.2 (guest 192.168.100.1/24), one uplink at
+#              a time (usb0 before wlan0, as in stock ThruRNDIS), control API on eth0:8080,
+#              usb-tx-watcher on.
+#   godseon    GodseonDongle. Its own VM; the dongle and a phone arrive over USB/IP
+#              (godseon.usbip=). The Mac reaches wlan0 from its VZ NAT bridge address and usb0
+#              from 10.94.8.2 (guest 10.94.8.1/30), both uplinks at once, control API on
+#              eth0:9408, usb-tx-watcher off (vhci_hcd has no xHCI rings to read).
+#
+# Kernel command line: thrurndis-wifi.mode=thrurndis|godseon. Without it, godseon when a
+# godseon.usbip= option is present, otherwise thrurndis, so the command lines both apps
+# already pass keep working.
+#
+# Sets THRURNDIS_WIFI_MODE, WIFI_HOST_LINK_GUEST_CIDR, WIFI_HOST_LINK_HOST_IPV4 (empty: the
+# gateway of eth0's VZ NAT lease, the Mac's bridge address) and WIFI_API_PORT. Builtins only:
+# uplink-watcher and api.cgi source it often.
+
+if [ -z "${THRURNDIS_WIFI_MODE:-}" ]; then
+    _wifi_mode_line=""
+    { read -r _wifi_mode_line </proc/cmdline; } 2>/dev/null
+    _wifi_mode_usbip=""
+    for _wifi_mode_opt in $_wifi_mode_line; do
+        case "$_wifi_mode_opt" in
+            thrurndis-wifi.mode=*) THRURNDIS_WIFI_MODE=${_wifi_mode_opt#*=} ;;
+            godseon.usbip=*) _wifi_mode_usbip=1 ;;
+        esac
+    done
+    case "${THRURNDIS_WIFI_MODE:-}" in
+        thrurndis|godseon) ;;
+        *) if [ -n "$_wifi_mode_usbip" ]; then THRURNDIS_WIFI_MODE=godseon; else THRURNDIS_WIFI_MODE=thrurndis; fi ;;
+    esac
+    unset _wifi_mode_line _wifi_mode_usbip _wifi_mode_opt
+fi
+
+case "$THRURNDIS_WIFI_MODE" in
+    godseon)
+        WIFI_HOST_LINK_GUEST_CIDR=10.94.8.1/30
+        WIFI_HOST_LINK_HOST_IPV4=""
+        WIFI_API_PORT=9408
+        ;;
+    *)
+        WIFI_HOST_LINK_GUEST_CIDR=192.168.100.1/24
+        WIFI_HOST_LINK_HOST_IPV4=192.168.100.2
+        WIFI_API_PORT=8080
+        ;;
+esac
