@@ -29,6 +29,7 @@ import gzip
 import hashlib
 import io
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -44,6 +45,10 @@ APORTS = "https://gitlab.alpinelinux.org/alpine/aports"
 APORTS_REPOS = ("main", "community", "testing")
 FIRMWARE_GIT = "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git"
 DISTFILES = "https://distfiles.alpinelinux.org/distfiles"
+# mirrors for when the endpoints above refuse automated clients
+APORTS_GITHUB = "https://api.github.com/repos/alpinelinux/aports"
+APORTS_RAW = "https://raw.githubusercontent.com/alpinelinux/aports"
+FIRMWARE_MIRROR = "https://gitlab.com/kernel-firmware/linux-firmware"
 USER_AGENT = "godseon-vm-builder/0.2"
 LICENSE_NAMES = ("COPYING*", "COPYRIGHT*", "LICENSE*", "LICENCE*", "NOTICE*", "UNLICENSE*")
 # Linux keeps its license texts in LICENSES/ and names them from every source file's SPDX line.
@@ -166,36 +171,105 @@ def inventory(root_db: str, host_db: str, root_files: set[str], kernel_package: 
 # ---------------------------------------------------------------------------- aports recipes
 
 
+# GODSEON_COMPLIANCE_MIRRORS=1 skips the primary endpoints, to try the mirrors (as on GitHub's
+# runners, which gitlab.alpinelinux.org answers with a bot check).
+_BLOCKED: set[str] = ({"aports", "linux-firmware"} if os.environ.get("GODSEON_COMPLIANCE_MIRRORS") == "1"
+                      else set())
+
+
+def web_blocked(error: Exception) -> bool:
+    """True for answers that mean "no automated clients here" rather than "no such file"."""
+    return not isinstance(error, urllib.error.HTTPError) or error.code in (403, 418, 429, 503)
+
+
+def github_aports_dir(path: str, commit: str, destination: pathlib.Path) -> bool:
+    """Copies aports/<path> at <commit> from github.com/alpinelinux/aports; False when the
+    mirror has no such directory. One git trees call lists the directory with file modes
+    (install scripts link to each other, pre-upgrade -> pre-install), the files come from
+    raw.githubusercontent.com. GITHUB_TOKEN, when set (GitHub Actions), lifts the API's rate
+    limit; it is sent to api.github.com only."""
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
+    if os.environ.get("GITHUB_TOKEN"):
+        headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+    request = urllib.request.Request(f"{APORTS_GITHUB}/git/trees/{commit}:{path}?recursive=1", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            listing = json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        if error.code in (404, 422):
+            return False
+        raise
+    if listing.get("truncated"):
+        fail(f"the GitHub tree of aports/{path} is truncated")
+    for entry in listing.get("tree", []):
+        relative = pathlib.PurePosixPath(entry["path"])
+        if entry["type"] != "blob" or relative.is_absolute() or ".." in relative.parts:
+            continue
+        data = http_get(f"{APORTS_RAW}/{commit}/{path}/{entry['path']}")
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
+        if entry["mode"] == "120000":
+            link = data.decode()
+            if "/" in link:
+                fail(f"aports/{path}/{entry['path']} links outside its directory: {link}")
+            target.symlink_to(link)
+        else:
+            target.write_bytes(data)
+            target.chmod(0o755 if entry["mode"] == "100755" else 0o644)
+    return True
+
+
 def fetch_recipe(origin: str, commit: str, cache: pathlib.Path) -> tuple[str, pathlib.Path]:
-    """aports/<repo>/<origin> at <commit>, cached as cache/aports/<commit>/<repo>/<origin>."""
+    """aports/<repo>/<origin> at <commit>, cached as cache/aports/<commit>/<repo>/<origin>.
+    GitLab's archive of that one directory first; if GitLab turns the builder away, Alpine's
+    GitHub mirror of aports (its contents API lists the directory at that commit)."""
     for repo in APORTS_REPOS:
         target = cache / "aports" / commit / repo / origin
         if (target / "APKBUILD").is_file():
             return repo, target
+    if "aports" not in _BLOCKED:
+        for repo in APORTS_REPOS:
+            url = f"{APORTS}/-/archive/{commit}/aports-{commit}.tar.gz?path={repo}/{origin}"
+            try:
+                data = http_get(url)
+            except (urllib.error.URLError, OSError) as error:
+                if isinstance(error, urllib.error.HTTPError) and error.code == 404:
+                    continue
+                if web_blocked(error):
+                    log(f"GitLab refused the archive ({error}); using the GitHub mirror of aports")
+                    _BLOCKED.add("aports")
+                    break
+                raise
+            prefix = f"aports-{commit}-{repo}-{origin}/{repo}/{origin}/"
+            target = cache / "aports" / commit / repo / origin
+            found = False
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+                for member in archive.getmembers():
+                    if not (member.isfile() or member.issym()) or not member.name.startswith(prefix):
+                        continue
+                    relative = member.name[len(prefix):]
+                    if not relative or ".." in pathlib.PurePosixPath(relative).parts:
+                        continue
+                    destination = target / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if member.issym():
+                        # install scripts link to each other (pre-upgrade -> pre-install)
+                        if "/" not in member.linkname:
+                            destination.unlink(missing_ok=True)
+                            destination.symlink_to(member.linkname)
+                        continue
+                    destination.write_bytes(archive.extractfile(member).read())
+                    destination.chmod(0o755 if member.mode & 0o111 else 0o644)
+                    found = found or relative == "APKBUILD"
+            if found:
+                return repo, target
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            fail(f"no aports recipe for {origin} at {commit}")
     for repo in APORTS_REPOS:
-        url = f"{APORTS}/-/archive/{commit}/aports-{commit}.tar.gz?path={repo}/{origin}"
-        try:
-            data = http_get(url)
-        except urllib.error.HTTPError as error:
-            if error.code == 404:
-                continue
-            raise
-        prefix = f"aports-{commit}-{repo}-{origin}/{repo}/{origin}/"
         target = cache / "aports" / commit / repo / origin
-        found = False
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-            for member in archive.getmembers():
-                if not member.isfile() or not member.name.startswith(prefix):
-                    continue
-                relative = member.name[len(prefix):]
-                if not relative or ".." in pathlib.PurePosixPath(relative).parts:
-                    continue
-                destination = target / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(archive.extractfile(member).read())
-                destination.chmod(0o755 if member.mode & 0o111 else 0o644)
-                found = found or relative == "APKBUILD"
-        if found:
+        if github_aports_dir(f"{repo}/{origin}", commit, target) and (target / "APKBUILD").is_file():
             return repo, target
         shutil.rmtree(target, ignore_errors=True)
     fail(f"no aports recipe for {origin} at {commit}")
@@ -338,16 +412,27 @@ def extract_licenses(distfile: pathlib.Path, destination: pathlib.Path) -> list[
     return found
 
 
-def firmware_file(path: str, tag: str) -> bytes | None:
+def firmware_file(path: str, tag: str, cache: pathlib.Path) -> bytes | None:
     """One file of linux-firmware at <tag>; None when it is missing or a directory (cgit
-    answers a directory's plain URL with an HTML listing)."""
+    answers a directory's plain URL with an HTML listing). From the official gitlab.com mirror
+    when git.kernel.org turns the builder away."""
+    if "linux-firmware" not in _BLOCKED:
+        try:
+            data = http_get(f"{FIRMWARE_GIT}/plain/{path}?h={tag}")
+            return None if data.startswith(b"<html><head><title>/") else data
+        except (urllib.error.URLError, OSError) as error:
+            if isinstance(error, urllib.error.HTTPError) and error.code == 404:
+                return None
+            if not web_blocked(error):
+                raise
+            log(f"git.kernel.org refused the web view ({error}); using the gitlab.com mirror of linux-firmware")
+            _BLOCKED.add("linux-firmware")
     try:
-        data = http_get(f"{FIRMWARE_GIT}/plain/{path}?h={tag}")
+        return http_get(f"{FIRMWARE_MIRROR}/-/raw/{tag}/{path}")
     except urllib.error.HTTPError as error:
         if error.code == 404:
             return None
         raise
-    return None if data.startswith(b"<html><head><title>/") else data
 
 
 def firmware_licenses(version: str, used: list[str], destination: pathlib.Path,
@@ -360,7 +445,7 @@ def firmware_licenses(version: str, used: list[str], destination: pathlib.Path,
     store.mkdir(parents=True, exist_ok=True)
     whence = store / "WHENCE"
     if not whence.is_file():
-        data = firmware_file("WHENCE", tag)
+        data = firmware_file("WHENCE", tag, cache)
         if data is None:
             fail(f"linux-firmware {tag} has no WHENCE")
         whence.write_bytes(data)
@@ -395,7 +480,7 @@ def firmware_licenses(version: str, used: list[str], destination: pathlib.Path,
             continue
         cached = store / name
         if not cached.is_file():
-            data = firmware_file(f"LICENSES/{name}", tag) or firmware_file(name, tag)
+            data = firmware_file(f"LICENSES/{name}", tag, cache) or firmware_file(name, tag, cache)
             if data is None:
                 if name in ("LICENSE", "LICENSE-CRITERIA.md"):
                     continue
@@ -575,7 +660,7 @@ def build(*, src: pathlib.Path, out: pathlib.Path, sources_out: pathlib.Path | N
                         "distfiles": [path.name for path in remote]})
         if staging:
             recipe_target = staging / "aports" / repo / package.origin
-            shutil.copytree(recipe, recipe_target, dirs_exist_ok=True)
+            shutil.copytree(recipe, recipe_target, symlinks=True, dirs_exist_ok=True)
             for path in remote:
                 destination = staging / "distfiles" / path.name
                 if not destination.exists():

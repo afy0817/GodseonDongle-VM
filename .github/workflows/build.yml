@@ -31,6 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Build the image, notices and sources
+        env:
+          # the GitHub mirror of aports (builder/compliance.py) when GitLab turns the runner away
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           if [ "$GITHUB_REF_TYPE" = tag ]; then version=${GITHUB_REF_NAME#v}; else version=dev-${GITHUB_SHA::7}; fi
           GODSEON_VM_VERSION=$version ./build.sh

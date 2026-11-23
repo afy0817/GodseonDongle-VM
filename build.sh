@@ -64,7 +64,7 @@ docker build --platform linux/arm64 --build-arg ALPINE_IMAGE="$ALPINE_IMAGE" \
 rm -f "$DIST/vm_assets.zip" "$DIST/vm_assets-sources.tar.gz" "$DIST/SHA256SUMS"
 COMPLIANCE_ARGS="--sources-out /dist/vm_assets-sources.tar.gz"
 [ -n "$QUICK" ] && COMPLIANCE_ARGS=--no-compliance
-docker run --rm --platform linux/arm64 -e PYTHONDONTWRITEBYTECODE=1 \
+docker run --rm --platform linux/arm64 -e PYTHONDONTWRITEBYTECODE=1 -e GODSEON_COMPLIANCE_MIRRORS -e GITHUB_TOKEN \
     -v "$ROOT:/src:ro" -v "$DIST:/dist" -v "$CACHE:/cache" godseon-vm-builder \
     python3 /src/builder/build_assets.py --src /src --out /dist/vm_assets --cache /cache \
     --version "$VERSION" --sources "$(sources_hash)" --commit "$COMMIT" \
