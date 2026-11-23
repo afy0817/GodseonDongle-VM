@@ -32,7 +32,7 @@ USB Wi-Fi 동글을 맥의 두 번째 무선랜으로 쓰게 해 주는 두 macO
 
 ## 릴리스
 
-`v` 태그를 올리면 GitHub Actions 가 이미지를 만들어 릴리스에 세 파일을 함께 올려요([.github/workflows/build.yml](.github/workflows/build.yml)). 올린 릴리스는 바꾸지 않고, 고친 이미지는 새 태그로 내요.
+릴리스는 `v` 태그를 push 할 때만 만들어요. GitHub Actions 가 이미지를 만들고, 따로 떼어 둔 릴리스 job 이 세 파일을 함께 올려요([.github/workflows/build.yml](.github/workflows/build.yml)). main push · PR · 수동 실행은 빌드만 하고 결과를 7일짜리 아티팩트로 남겨요. 올린 릴리스는 바꾸지 않고, 고친 이미지는 새 태그로 내요.
 
 | 파일 | 내용 |
 |---|---|
