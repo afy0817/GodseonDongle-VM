@@ -6,6 +6,7 @@ version = 1
 [[annotations]]
 path = [
   ".gitignore",
+  ".claude/settings.json",
   "initramfs/UPSTREAM_COMMIT",
   "kernel/README.md",
   "dev/vmrun.entitlements",
